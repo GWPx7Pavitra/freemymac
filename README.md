@@ -85,3 +85,7 @@ open -n --env FREEMYMAC_HOME=/tmp/freemymac-test dist/FreeMyMac.app
 - `Sources/FreeMyMacCore`: the scanner, cleanup catalog, safety guard, and deletion. No UI.
 - `Sources/FreeMyMac`: the SwiftUI app.
 - `Tests/FreeMyMacCoreTests`: tests that only delete inside throwaway folders.
+
+## License
+
+[MIT](LICENSE)
