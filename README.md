@@ -36,6 +36,16 @@ Without it, macOS hides Mail, Messages, Photos, the Trash, and every app's priva
 
 The app is signed locally, so **rebuilding it changes its identity**, and macOS may ask you to grant access again.
 
+## How scanning works
+
+The first launch reads the whole disk once and saves the result to `~/Library/Caches/com.pavitra.freemymac/`. After that:
+
+- **Opening the app** shows the saved scan at once. FreeMyMac then asks macOS which folders changed since it last looked, including while it was closed, and re-reads only those.
+- **While it's open**, macOS reports changes as they happen, so deleting something, here or anywhere else, updates the figures within a couple of seconds.
+- **The cleanup list and app sizes** come from the scan instead of measuring each folder again.
+
+**Rescan** in the toolbar still reads everything from scratch. FreeMyMac does that on its own only if macOS loses track of changes, or when Full Disk Access is turned on or off.
+
 ## How deleting works
 
 | What | What happens | Asks first? |

@@ -5,13 +5,13 @@ public final class FileNode: Identifiable {
     public let path: String
     public let isDirectory: Bool
     public let modified: Date?
-    public fileprivate(set) var size: Int64
-    public fileprivate(set) var children: [FileNode] = []
+    public internal(set) var size: Int64
+    public internal(set) var children: [FileNode] = []
     /// Items too small to keep individually, rolled into one figure to keep memory flat.
-    public fileprivate(set) var smallSize: Int64 = 0
-    public fileprivate(set) var smallCount = 0
-    public fileprivate(set) var isBlocked = false
-    public fileprivate(set) weak var parent: FileNode?
+    public internal(set) var smallSize: Int64 = 0
+    public internal(set) var smallCount = 0
+    public internal(set) var isBlocked = false
+    public internal(set) weak var parent: FileNode?
 
     public var id: String { path }
 
@@ -136,7 +136,81 @@ public enum DiskScanner {
     }
 }
 
-private final class Walker: @unchecked Sendable {
+extension DiskScanner {
+    public struct Summary: Sendable {
+        public let largeFiles: [LargeFile]
+        public let blocked: [String]
+    }
+
+    /// The large files and unreadable folders in a tree, read from the tree
+    /// itself, so it stays right as the tree is updated piece by piece.
+    public static func summarize(_ root: FileNode, largeFileThreshold: Int64 = Options().largeFileThreshold) -> Summary {
+        var large: [LargeFile] = []
+        var blocked: [String] = []
+        var stack = [root]
+        while let node = stack.popLast() {
+            if node.isDirectory {
+                if node.isBlocked, blocked.count < 5000 { blocked.append(node.path) }
+                stack.append(contentsOf: node.children)
+            } else if node.size >= largeFileThreshold {
+                large.append(LargeFile(path: node.path, name: node.name, size: node.size, modified: node.modified))
+            }
+        }
+        return Summary(largeFiles: large.sorted { $0.size > $1.size }, blocked: blocked.sorted())
+    }
+}
+
+/// The scanned tree, shared by the window and background work. The window
+/// reads it on the main thread without waiting. Every change happens on the
+/// main thread inside `write`, and any other thread reads inside `read`, so
+/// the two can never overlap.
+public final class SharedTree: @unchecked Sendable {
+    public let root: FileNode
+    private let lock: UnsafeMutablePointer<pthread_rwlock_t>
+
+    public init(root: FileNode) {
+        self.root = root
+        lock = .allocate(capacity: 1)
+        pthread_rwlock_init(lock, nil)
+    }
+
+    deinit {
+        pthread_rwlock_destroy(lock)
+        lock.deallocate()
+    }
+
+    public func read<T>(_ body: (FileNode) throws -> T) rethrows -> T {
+        pthread_rwlock_rdlock(lock)
+        defer { pthread_rwlock_unlock(lock) }
+        return try body(root)
+    }
+
+    public func write<T>(_ body: (FileNode) throws -> T) rethrows -> T {
+        pthread_rwlock_wrlock(lock)
+        defer { pthread_rwlock_unlock(lock) }
+        return try body(root)
+    }
+
+    /// The measured size of `path`, if the tree holds it. Items under 1 MiB are
+    /// folded into their folder's total, so those come back nil.
+    public func size(of path: String) -> Int64? {
+        read { root in
+            guard let node = root.node(at: path), !node.isBlocked else { return nil }
+            return node.size
+        }
+    }
+
+    /// Subfolders of `path` the tree holds, which are all those of 1 MiB or more.
+    public func folders(in path: String) -> [String]? {
+        read { root in
+            root.node(at: path)?.children.filter { $0.isDirectory && !$0.isBlocked }.map(\.path)
+        }
+    }
+}
+
+/// Walks folders with plain syscalls. One walker is one pass: it remembers hard
+/// links it has already counted, so a file with several names is counted once.
+final class Walker: @unchecked Sendable {
     let options: DiskScanner.Options
     let progress: ScanProgress
     private let lock = NSLock()
@@ -150,9 +224,31 @@ private final class Walker: @unchecked Sendable {
         let inode: ino_t
     }
 
-    init(options: DiskScanner.Options, progress: ScanProgress) {
+    struct Subfolder {
+        let name: String
+        let blocks: Int64
+        let modified: Date?
+    }
+
+    /// One folder's own entries: its files, counted, and its subfolders, not yet walked.
+    struct Entries {
+        var subfolders: [Subfolder] = []
+        var keptFiles: [FileNode] = []
+        var fileBlocks: Int64 = 0
+        var smallSize: Int64 = 0
+        var smallCount = 0
+    }
+
+    enum Opened {
+        case listed(Entries)
+        case blocked
+        case gone
+    }
+
+    init(options: DiskScanner.Options, progress: ScanProgress, device: dev_t = 0) {
         self.options = options
         self.progress = progress
+        self.rootDevice = device
     }
 
     func scan(root: String) -> FileNode {
@@ -170,35 +266,19 @@ private final class Walker: @unchecked Sendable {
         return walk(path: root, name: name, ownBlocks: Int64(st.st_blocks) * 512, modified: Self.date(st), depth: 0)
     }
 
-    private func walk(path: String, name: String, ownBlocks: Int64, modified: Date?, depth: Int) -> FileNode {
-        let display = displayPath(path)
-        let node = FileNode(name: name, path: display, isDirectory: true, size: ownBlocks, modified: modified)
-        if progress.isCancelled { return node }
-
+    /// Reads one folder's entries without descending into its subfolders.
+    func list(path: String) -> Opened {
         let fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0, let dir = fdopendir(fd) else {
             let code = errno
             if fd >= 0 { close(fd) }
-            if code == EPERM || code == EACCES {
-                node.isBlocked = true
-                lock.withLock { if blocked.count < 5000 { blocked.append(display) } }
-            }
-            return node
+            return code == EPERM || code == EACCES ? .blocked : .gone
         }
+        defer { closedir(dir) }
 
-        struct Sub {
-            let name: String
-            let blocks: Int64
-            let modified: Date?
-        }
-        var subdirs: [Sub] = []
-        var keptFiles: [FileNode] = []
-        var total = ownBlocks
-        var smallSize: Int64 = 0
-        var smallCount = 0
+        let display = displayPath(path)
+        var entries = Entries()
         var fileCount = 0
-        var fileBytes: Int64 = 0
-        let separator = path.hasSuffix("/") ? "" : "/"
 
         while let entry = readdir(dir) {
             let length = Int(entry.pointee.d_namlen)
@@ -216,7 +296,7 @@ private final class Walker: @unchecked Sendable {
 
             if kind == S_IFDIR {
                 if st.st_dev == rootDevice {
-                    subdirs.append(Sub(name: entryName, blocks: blocks, modified: Self.date(st)))
+                    entries.subfolders.append(Subfolder(name: entryName, blocks: blocks, modified: Self.date(st)))
                 }
                 continue
             }
@@ -227,41 +307,63 @@ private final class Walker: @unchecked Sendable {
                 let isNew = lock.withLock { seenLinks.insert(link).inserted }
                 if !isNew { continue }
             }
-            total += blocks
             fileCount += 1
-            fileBytes += blocks
+            entries.fileBlocks += blocks
             if blocks >= options.keepThreshold {
                 let childPath = display == "/" ? "/" + entryName : display + "/" + entryName
                 let modifiedDate = Self.date(st)
-                keptFiles.append(FileNode(name: entryName, path: childPath, isDirectory: false, size: blocks, modified: modifiedDate))
+                entries.keptFiles.append(FileNode(name: entryName, path: childPath, isDirectory: false, size: blocks, modified: modifiedDate))
                 if blocks >= options.largeFileThreshold {
                     let file = LargeFile(path: childPath, name: entryName, size: blocks, modified: modifiedDate)
                     lock.withLock { large.append(file) }
                 }
             } else {
-                smallSize += blocks
-                smallCount += 1
+                entries.smallSize += blocks
+                entries.smallCount += 1
             }
         }
-        closedir(dir)
-        progress.add(files: fileCount, bytes: fileBytes)
+        progress.add(files: fileCount, bytes: entries.fileBlocks)
+        return .listed(entries)
+    }
 
-        var results = [FileNode?](repeating: nil, count: subdirs.count)
+    func walk(path: String, name: String, ownBlocks: Int64, modified: Date?, depth: Int) -> FileNode {
+        let display = displayPath(path)
+        let node = FileNode(name: name, path: display, isDirectory: true, size: ownBlocks, modified: modified)
+        if progress.isCancelled { return node }
+
+        let entries: Entries
+        switch list(path: path) {
+        case .listed(let found):
+            entries = found
+        case .blocked:
+            node.isBlocked = true
+            lock.withLock { if blocked.count < 5000 { blocked.append(display) } }
+            return node
+        case .gone:
+            return node
+        }
+
+        let subfolders = entries.subfolders
+        let separator = path.hasSuffix("/") ? "" : "/"
+        var results = [FileNode?](repeating: nil, count: subfolders.count)
         func scanSub(_ index: Int) -> FileNode {
-            let sub = subdirs[index]
+            let sub = subfolders[index]
             return walk(path: path + separator + sub.name, name: sub.name, ownBlocks: sub.blocks, modified: sub.modified, depth: depth + 1)
         }
-        if depth < options.parallelDepth, subdirs.count > 1 {
+        if depth < options.parallelDepth, subfolders.count > 1 {
             let resultsLock = NSLock()
-            DispatchQueue.concurrentPerform(iterations: subdirs.count) { index in
+            DispatchQueue.concurrentPerform(iterations: subfolders.count) { index in
                 let result = scanSub(index)
                 resultsLock.withLock { results[index] = result }
             }
         } else {
-            for index in subdirs.indices { results[index] = scanSub(index) }
+            for index in subfolders.indices { results[index] = scanSub(index) }
         }
 
-        var kept = keptFiles
+        var kept = entries.keptFiles
+        var total = ownBlocks + entries.fileBlocks
+        var smallSize = entries.smallSize
+        var smallCount = entries.smallCount
         for case let child? in results {
             total += child.size
             if child.size >= options.keepThreshold || child.isBlocked {
@@ -280,7 +382,7 @@ private final class Walker: @unchecked Sendable {
         return node
     }
 
-    private static func date(_ st: stat) -> Date? {
+    static func date(_ st: stat) -> Date? {
         Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec))
     }
 }

@@ -24,7 +24,7 @@ public struct AppLeftover: Identifiable, Sendable, Hashable {
 }
 
 public enum AppInventory {
-    public static func installedApps(env: FreeMyMacEnv) -> [InstalledApp] {
+    public static func installedApps(env: FreeMyMacEnv, tree: SharedTree? = nil) -> [InstalledApp] {
         var bundles: [String] = []
         func collect(_ folder: String, descend: Bool) {
             guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder) else { return }
@@ -49,7 +49,7 @@ public enum AppInventory {
             let name = (bundle?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
                 ?? ((path as NSString).lastPathComponent as NSString).deletingPathExtension
             let app = InstalledApp(path: path, name: name, bundleID: bundle?.bundleIdentifier ?? "",
-                                   size: DiskScanner.measure(path), lastUsed: lastUsed(path))
+                                   size: tree?.size(of: path) ?? DiskScanner.measure(path), lastUsed: lastUsed(path))
             lock.withLock { apps[index] = app }
         }
         return apps.compactMap { $0 }.sorted { $0.size > $1.size }

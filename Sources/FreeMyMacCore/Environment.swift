@@ -31,6 +31,15 @@ public struct FreeMyMacEnv: Sendable {
     }
 
     public func inHome(_ relative: String) -> String { home + "/" + relative }
+
+    /// Where the last scan is saved. Always in the real Caches folder, named
+    /// for the scanned folder, so test mode keeps a cache of its own.
+    public var scanCachePath: String {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in scanRoot.utf8 { hash = (hash ^ UInt64(byte)) &* 0x100_0000_01b3 }
+        let name = isFixture ? "scan-test-\(String(hash, radix: 16)).bin" : "scan.bin"
+        return NSHomeDirectory() + "/Library/Caches/com.pavitra.freemymac/" + name
+    }
 }
 
 /// The Data volume's paths are visible both as `/System/Volumes/Data/Users/x`

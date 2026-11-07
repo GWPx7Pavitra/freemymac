@@ -65,6 +65,9 @@ public enum CatalogBuilder {
         public var now = Date()
         public var staleDays = 30
         public var oldDownloadDays = 90
+        /// The current scan. Sizes come from it instead of reading each folder
+        /// again. Anything it doesn't hold is measured on disk.
+        public var tree: SharedTree?
 
         public init(env: FreeMyMacEnv, safety: SafetyGuard) {
             self.env = env
@@ -76,7 +79,7 @@ public enum CatalogBuilder {
     private static let cacheExclusions: Set<String> = [
         "google", "bravesoftware", "firefox", "microsoft edge", "com.operasoftware.opera",
         "company.thebrowser.browser", "homebrew", "pip", "yarn", "cocoapods", "go-build",
-        "geoservices", "cloudkit", "familycircle", "ms-playwright", "freemymac",
+        "geoservices", "cloudkit", "familycircle", "ms-playwright", "freemymac", "com.pavitra.freemymac",
     ]
 
     private static let aliases: [String: [String]] = [
@@ -192,12 +195,27 @@ public enum CatalogBuilder {
 
     // MARK: - Homebrew
 
+    /// `brew cleanup --dry-run` takes seconds, so its answer is kept for a while.
+    private static let brewLock = NSLock()
+    nonisolated(unsafe) private static var brewEstimate: (value: Int64, at: Date)?
+
+    /// Call after running `brew cleanup`, so the next catalog asks Homebrew again.
+    public static func forgetHomebrewEstimate() {
+        brewLock.withLock { brewEstimate = nil }
+    }
+
     private static func homebrewItem(_ input: Input) -> CleanupItem? {
         guard !input.env.isFixture else { return nil }
         guard let brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].first(where: FileManager.default.isExecutableFile) else { return nil }
         let arguments = ["cleanup", "-s", "--prune=all"]
-        guard let output = CommandRunner.run(brew, arguments + ["--dry-run"]) else { return nil }
-        let estimate = parseBrewEstimate(output)
+        let estimate: Int64
+        if let cached = brewLock.withLock({ brewEstimate }), input.now.timeIntervalSince(cached.at) < 30 * 60 {
+            estimate = cached.value
+        } else {
+            guard let output = CommandRunner.run(brew, arguments + ["--dry-run"]) else { return nil }
+            estimate = parseBrewEstimate(output)
+            brewLock.withLock { brewEstimate = (estimate, input.now) }
+        }
         guard estimate > 0 else { return nil }
         var result = CleanupItem(id: "homebrew", title: "Old Homebrew versions",
                                  detail: "Outdated package versions and downloads. Runs `brew cleanup`, so current packages keep working.",
@@ -354,6 +372,29 @@ public enum CatalogBuilder {
             }
         }
 
+        // With a scan to hand, its folders are walked in memory instead of on disk.
+        // It holds every folder of 1 MiB or more, which is every one worth listing.
+        if let tree = input.tree, let tops = tree.folders(in: env.home) {
+            func visitTree(_ directory: String, depth: Int) {
+                guard depth <= 7 else { return }
+                for path in tree.folders(in: directory) ?? [] {
+                    let name = (path as NSString).lastPathComponent
+                    if isDependencyFolder(name, in: directory) {
+                        if projectLastTouched(directory, excluding: name) < cutoff { found.append(path) }
+                        continue
+                    }
+                    if name.hasPrefix(".") || name.hasSuffix(".app") { continue }
+                    visitTree(path, depth: depth + 1)
+                }
+            }
+            for top in tops {
+                let name = (top as NSString).lastPathComponent
+                guard !name.hasPrefix("."), !skipTop.contains(name.lowercased()) else { continue }
+                visitTree(top, depth: 1)
+            }
+            return found
+        }
+
         for top in children(of: env.home) {
             let name = (top as NSString).lastPathComponent
             var st = stat()
@@ -407,7 +448,8 @@ public enum CatalogBuilder {
         let lock = NSLock()
         DispatchQueue.concurrentPerform(iterations: allowed.count) { index in
             let path = allowed[index]
-            let entry = CatalogEntry(path: path, name: label(path), size: DiskScanner.measure(path), owner: owner(path))
+            let size = input.tree?.size(of: path) ?? DiskScanner.measure(path)
+            let entry = CatalogEntry(path: path, name: label(path), size: size, owner: owner(path))
             lock.withLock { sized[index] = entry }
         }
         let entries = sized.compactMap { $0 }.filter { $0.size > 0 }.sorted { $0.size > $1.size }

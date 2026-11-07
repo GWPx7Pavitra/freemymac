@@ -57,7 +57,7 @@ struct CleanupView: View {
         .navigationTitle("Clean Up")
         .toolbar {
             ToolbarItem {
-                Button { model.loadCatalog() } label: {
+                Button { model.loadCatalog(fromDisk: true) } label: {
                     Label("Measure Again", systemImage: "arrow.clockwise")
                 }
                 .disabled(model.isLoadingCatalog)
@@ -122,7 +122,7 @@ struct CleanupRow: View {
         Group {
             HStack(spacing: 10) {
                 Button {
-                    isExpanded.toggle()
+                    withAnimation(.snappy(duration: 0.25)) { isExpanded.toggle() }
                 } label: {
                     Image(systemName: "chevron.right")
                         .font(.caption.weight(.semibold))

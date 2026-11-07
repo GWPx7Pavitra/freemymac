@@ -9,10 +9,12 @@ struct FreeMyMacApp: App {
         WindowGroup("FreeMyMac") {
             RootView()
                 .environmentObject(model)
-                .frame(minWidth: 940, minHeight: 640)
+                .environmentObject(model.scanStatus)
+                .frame(minWidth: 680, minHeight: 460)
                 .containerBackground(.ultraThinMaterial, for: .window)
                 .task { model.start() }
         }
+        .defaultSize(width: 1080, height: 740)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {}
@@ -71,18 +73,23 @@ struct RootView: View {
                     .badge(screen == .cleanup && model.totalReclaimable > 0 ? Text(formatBytes(model.totalReclaimable)) : nil)
                     .tag(screen)
             }
-            .navigationSplitViewColumnWidth(min: 200, ideal: 220)
+            .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 300)
             .safeAreaInset(edge: .bottom) { SidebarFooter() }
         } detail: {
-            Group {
-                switch model.screen ?? .overview {
-                case .overview: OverviewView()
-                case .cleanup: CleanupView()
-                case .explore: ExploreView()
-                case .largeFiles: LargeFilesView()
-                case .apps: AppsView()
+            ZStack {
+                Group {
+                    switch model.screen ?? .overview {
+                    case .overview: OverviewView()
+                    case .cleanup: CleanupView()
+                    case .explore: ExploreView()
+                    case .largeFiles: LargeFilesView()
+                    case .apps: AppsView()
+                    }
                 }
+                .id(model.screen)
+                .transition(.opacity)
             }
+            .animation(.smooth(duration: 0.2), value: model.screen)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .overlay(alignment: .bottom) { ToastView() }
         }
@@ -185,7 +192,7 @@ struct ToastView: View {
             .padding(.horizontal, 16)
             // Clears the Clean Selected bar on that screen.
             .padding(.bottom, model.screen == .cleanup ? 88 : 16)
-            .transition(.opacity)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
         }
     }
 }
@@ -208,9 +215,23 @@ struct PathIcon: View {
     let path: String
 
     var body: some View {
-        Image(nsImage: NSWorkspace.shared.icon(forFile: path))
+        Image(nsImage: IconCache.icon(for: path))
             .resizable()
+            .interpolation(.high)
             .frame(width: 20, height: 20)
             .accessibilityHidden(true)
+    }
+}
+
+/// The live file count. Only this text observes the counter, so the rest of the
+/// window doesn't redraw while a scan runs.
+struct ScannedFilesText: View {
+    @EnvironmentObject var status: ScanStatus
+    let format: (String) -> String
+
+    var body: some View {
+        Text(format(status.files.formatted()))
+            .monospacedDigit()
+            .contentTransition(.numericText())
     }
 }

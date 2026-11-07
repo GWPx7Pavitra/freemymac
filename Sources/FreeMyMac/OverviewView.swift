@@ -20,7 +20,7 @@ struct OverviewView: View {
                 else if model.hiddenBytes > 5 << 30, !model.isScanning { hiddenNote }
                 biggestFolders
             }
-            .padding(28)
+            .padding(24)
             .frame(maxWidth: 860, alignment: .leading)
             .frame(maxWidth: .infinity)
         }
@@ -42,9 +42,14 @@ struct OverviewView: View {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text(formatBytes(volume.free))
                         .font(.system(size: 52, weight: .semibold))
+                        .contentTransition(.numericText(value: Double(volume.free)))
+                        .animation(.smooth(duration: 0.5), value: volume.free)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
                     Text("free of \(formatBytes(volume.total))")
                         .font(.title3)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
                 HStack(spacing: 6) {
                     if volume.usedFraction >= 0.9 {
@@ -63,16 +68,39 @@ struct OverviewView: View {
                 }
                 .foregroundStyle(.secondary)
             }
-            if model.isScanning {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("Scanning the disk: \(model.scannedFiles.formatted()) files so far")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
+            freshness
+                .font(.callout)
+                .foregroundStyle(.secondary)
                 .padding(.top, 4)
+                .animation(.smooth(duration: 0.25), value: model.isScanning)
+                .animation(.smooth(duration: 0.25), value: model.isCatchingUp)
+        }
+    }
+
+    /// Says how current the figures are: scanning, catching up, or kept live.
+    @ViewBuilder
+    private var freshness: some View {
+        if model.isScanning {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                ScannedFilesText { "Scanning the disk: \($0) files so far" }
             }
+            .transition(.opacity)
+        } else if model.isCatchingUp {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Catching up on changes…")
+            }
+            .transition(.opacity)
+        } else if let scanned = model.lastFullScan {
+            Label {
+                Text(model.isWatching
+                     ? "Up to date. Changes are picked up as they happen. Last full scan \(scanned.formatted(.relative(presentation: .named)))."
+                     : "As of \(scanned.formatted(.relative(presentation: .named))).")
+            } icon: {
+                Image(systemName: model.isWatching ? "dot.radiowaves.left.and.right" : "clock")
+            }
+            .transition(.opacity)
         }
     }
 
@@ -83,7 +111,20 @@ struct OverviewView: View {
 
     private var actions: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
+            // Side by side when there's room, stacked in a narrow window.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) { actionButtons }
+                VStack(alignment: .leading, spacing: 10) { actionButtons }
+            }
+            Text("Free Up removes caches, logs, and old package versions that rebuild themselves. Your documents and anything in open apps stay as they are.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private var actionButtons: some View {
                 Button {
                     model.freeUpSafeItems()
                 } label: {
@@ -100,12 +141,6 @@ struct OverviewView: View {
                 .buttonStyle(.glass)
                 .controlSize(.large)
                 .disabled(model.reviewReclaimable == 0)
-            }
-            Text("Free Up removes caches, logs, and old package versions that rebuild themselves. Your documents and anything in open apps stay as they are.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
     }
 
     private var permissionCard: some View {
@@ -120,14 +155,20 @@ struct OverviewView: View {
             Text("Click the button, turn on FreeMyMac in the list, then come back. If FreeMyMac isn't listed, click + and choose it. macOS may ask you to reopen the app.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Button("Open Full Disk Access Settings") { model.openFullDiskAccessSettings() }
-                    .controlSize(.large)
-                Button("Show FreeMyMac in Finder") { model.revealApp() }
-                    .controlSize(.large)
+            ViewThatFits(in: .horizontal) {
+                HStack { permissionButtons }
+                VStack(alignment: .leading) { permissionButtons }
             }
         }
         .glassCard()
+    }
+
+    @ViewBuilder
+    private var permissionButtons: some View {
+        Button("Open Full Disk Access Settings") { model.openFullDiskAccessSettings() }
+            .controlSize(.large)
+        Button("Show FreeMyMac in Finder") { model.revealApp() }
+            .controlSize(.large)
     }
 
     private var hiddenNote: some View {
@@ -143,15 +184,14 @@ struct OverviewView: View {
 
     @ViewBuilder
     private var biggestFolders: some View {
-        let folders = model.root?.heaviest(limit: 8, minimum: 256 << 20) ?? []
+        let folders = model.biggestFolders
         if !folders.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Biggest folders").font(.headline)
                 VStack(spacing: 0) {
                     ForEach(folders) { node in
                         Button {
-                            model.exploring = node.isDirectory ? node : node.parent
-                            model.screen = .explore
+                            model.showInExplorer(node)
                         } label: {
                             HStack(spacing: 10) {
                                 PathIcon(path: node.path)
@@ -215,6 +255,7 @@ struct CapacityBar: View {
             }
         }
         .frame(height: 28)
+        .animation(.smooth(duration: 0.5), value: segments)
     }
 
     private func description(_ segment: StorageSegment) -> String {
@@ -239,15 +280,20 @@ struct BreakdownTable: View {
                     Text(segment.title)
                     Text(formatBytes(segment.size))
                         .monospacedDigit()
+                        .contentTransition(.numericText(value: Double(segment.size)))
                         .gridColumnAlignment(.trailing)
                     Text(percent(segment.size, of: total))
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                         .gridColumnAlignment(.trailing)
+                    // Gives way first when the window is narrow.
                     Text(explanation(segment.kind))
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                        .layoutPriority(-1)
                 }
                 .accessibilityElement(children: .combine)
             }

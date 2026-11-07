@@ -12,38 +12,27 @@ struct ExploreView: View {
                 VStack(spacing: 0) {
                     Breadcrumbs(node: node)
                     Divider()
-                    List {
-                        if node.isBlocked {
-                            blockedNotice
-                        }
-                        ForEach(node.children) { child in
-                            ExploreRow(node: child, parentSize: node.size)
-                        }
-                        if node.smallCount > 0 {
-                            HStack {
-                                Image(systemName: "ellipsis.circle").frame(width: 20).foregroundStyle(.tertiary)
-                                    .accessibilityHidden(true)
-                                Text("\(node.smallCount.formatted()) smaller items").foregroundStyle(.secondary)
-                                Spacer()
-                                Text(formatBytes(node.smallSize)).monospacedDigit().foregroundStyle(.secondary)
-                            }
-                        }
+                    // One list per folder, so moving between folders slides
+                    // the old one out and the new one in.
+                    ZStack {
+                        folderList(node)
+                            .id(node.path)
+                            .transition(.push(from: model.exploreEdge))
                     }
-                    .listStyle(.inset)
-                    .scrollContentBackground(.hidden)
+                    .clipped()
                 }
             } else {
                 ContentUnavailableView {
                     Label("Scanning your disk", systemImage: "internaldrive")
                 } description: {
-                    Text("\(model.scannedFiles.formatted()) files so far").monospacedDigit()
+                    ScannedFilesText { "\($0) files so far" }
                 }
             }
         }
         .navigationTitle("Explore Disk")
         .toolbar {
             ToolbarItem {
-                Button { model.scanDisk() } label: {
+                Button { model.rescanEverything() } label: {
                     if model.isScanning {
                         ProgressView().controlSize(.small)
                     } else {
@@ -51,9 +40,31 @@ struct ExploreView: View {
                     }
                 }
                 .disabled(model.isScanning)
-                .help("Scan the disk again")
+                .help("Read the whole disk again")
             }
         }
+    }
+
+    private func folderList(_ node: FileNode) -> some View {
+        List {
+            if node.isBlocked {
+                blockedNotice
+            }
+            ForEach(node.children) { child in
+                ExploreRow(node: child, parentSize: node.size)
+            }
+            if node.smallCount > 0 {
+                HStack {
+                    Image(systemName: "ellipsis.circle").frame(width: 20).foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                    Text("\(node.smallCount.formatted()) smaller items").foregroundStyle(.secondary)
+                    Spacer()
+                    Text(formatBytes(node.smallSize)).monospacedDigit().foregroundStyle(.secondary)
+                }
+            }
+        }
+        .listStyle(.inset)
+        .scrollContentBackground(.hidden)
     }
 
     private var blockedNotice: some View {
@@ -88,7 +99,7 @@ private struct Breadcrumbs: View {
     var body: some View {
         HStack(spacing: 8) {
             Button {
-                model.exploring = node.parent
+                model.explore(node.parent)
             } label: {
                 Image(systemName: "chevron.left")
             }
@@ -104,7 +115,7 @@ private struct Breadcrumbs: View {
                                 .accessibilityHidden(true)
                         }
                         Button(item.parent == nil ? "Macintosh HD" : item.name) {
-                            model.exploring = item
+                            model.explore(item)
                         }
                         .buttonStyle(.plain)
                         .fontWeight(item === node ? .semibold : .regular)
@@ -125,13 +136,13 @@ private struct ExploreRow: View {
     let node: FileNode
     let parentSize: Int64
 
-    private var verdict: SafetyGuard.Verdict { model.safety.check(node.path) }
+    private var verdict: SafetyGuard.Verdict { model.verdict(for: node.path) }
     private var canOpen: Bool { node.isDirectory && (!node.children.isEmpty || node.smallCount > 0 || node.isBlocked) }
 
     var body: some View {
         HStack(spacing: 10) {
             Button {
-                if canOpen { model.exploring = node }
+                if canOpen { model.explore(node) }
             } label: {
                 HStack(spacing: 10) {
                     PathIcon(path: node.path)
@@ -144,7 +155,7 @@ private struct ExploreRow: View {
                     }
                     Spacer(minLength: 12)
                     SizeBar(fraction: parentSize > 0 ? Double(node.size) / Double(parentSize) : 0)
-                        .frame(width: 120)
+                        .frame(minWidth: 36, idealWidth: 120, maxWidth: 120)
                     Text(node.isBlocked && node.size == 0 ? "Hidden" : formatBytes(node.size))
                         .monospacedDigit()
                         .frame(width: 76, alignment: .trailing)
@@ -183,6 +194,7 @@ private struct SizeBar: View {
                     .fill(Palette.series1)
                     .frame(width: max(2, geometry.size.width * min(1, fraction)))
             }
+            .animation(.smooth(duration: 0.4), value: fraction)
         }
         .frame(height: 6)
         .accessibilityHidden(true)
@@ -201,8 +213,11 @@ struct LargeFilesView: View {
                     Label(model.isScanning ? "Looking for large files" : "No files over 100 MB",
                           systemImage: "doc.richtext")
                 } description: {
-                    Text(model.isScanning ? "\(model.scannedFiles.formatted()) files checked so far" : "Files macOS protects aren't listed.")
-                        .monospacedDigit()
+                    if model.isScanning {
+                        ScannedFilesText { "\($0) files checked so far" }
+                    } else {
+                        Text("Files macOS protects aren't listed.")
+                    }
                 }
             } else {
                 List {
@@ -302,12 +317,13 @@ private struct AppRow: View {
     @EnvironmentObject var model: AppModel
     let app: InstalledApp
 
-    private var verdict: SafetyGuard.Verdict { model.safety.check(app.path) }
+    private var verdict: SafetyGuard.Verdict { model.verdict(for: app.path) }
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(nsImage: NSWorkspace.shared.icon(forFile: app.path))
+            Image(nsImage: IconCache.icon(for: app.path))
                 .resizable()
+                .interpolation(.high)
                 .frame(width: 32, height: 32)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 1) {
